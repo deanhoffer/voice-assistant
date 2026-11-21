@@ -1,0 +1,43 @@
+#!/usr/bin/env zsh
+# whisper — start/stop whisper-server (127.0.0.1:8181) on its own, apart from ai-toggle
+#   whisper            toggle on/off
+#   whisper on|off     start / stop (off frees its ~1-2 GiB of VRAM)
+#   whisper status     state, memory, VRAM
+# Used by the voice assistant, Campfire's push-to-talk and SillyTavern (via whisper-bridge).
+# `ai-toggle on` starts it too (the voice assistant needs it); `ai-toggle off` leaves it running.
+emulate -L zsh
+
+UNIT=whisper-server
+HEALTH=http://127.0.0.1:8181/health
+
+on() {
+  systemctl --user start $UNIT || return 1
+  print -n "starting"
+  local i
+  for i in {1..60}; do
+    curl -sf -o /dev/null $HEALTH && { print "\nready"; return }
+    print -n .; sleep 1
+  done
+  print "\ntimed out waiting for $HEALTH (see: whisper status)"; return 1
+}
+
+off() {
+  systemctl --user stop $UNIT && print "stopped"
+  systemctl --user -q is-active voice-assistant && print "note: the voice assistant can't hear until 'whisper on'"
+  return 0
+}
+
+status() {
+  local mem=$(systemctl --user show -p MemoryCurrent --value $UNIT)
+  [[ $mem == <-> ]] && mem=$(printf '%.1f GiB' $(( mem / 2.0**30 ))) || mem=-
+  printf '%-16s %-10s %s\n' $UNIT "$(systemctl --user is-active $UNIT)" $mem
+  ai-toggle vram 2>/dev/null
+}
+
+case ${1:-toggle} in
+  on)     on ;;
+  off)    off ;;
+  status) status ;;
+  toggle) if systemctl --user -q is-active $UNIT; then off; else on; fi ;;
+  *)      print -u2 "usage: whisper [on|off|status]"; exit 2 ;;
+esac

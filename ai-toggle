@@ -1,0 +1,84 @@
+#!/usr/bin/env zsh
+# ai-toggle — start/stop the local AI stack (llama-server, voice-assistant)
+#   ai-toggle            toggle on/off
+#   ai-toggle on|off     start / stop (off frees the LLM's VRAM for gaming)
+#                        whisper-server is separate (`whisper on|off`): on starts it if needed, off leaves it
+#   ai-toggle status     unit states, memory, VRAM
+#   ai-toggle log        follow the voice assistant output
+#   ai-toggle mem [topic]  list the assistant's memory topics / edit one
+#   ai-toggle chat       chat with the assistant in this terminal (same session as voice)
+emulate -L zsh
+
+TARGET=local-ai.target
+UNITS=(whisper-server llama-server voice-assistant)
+HEALTH=(http://127.0.0.1:8181/health http://127.0.0.1:8180/health)
+
+vram() {
+  # the card with the most VRAM is the RX 7800 XT
+  local dev best total=0
+  for dev in /sys/class/drm/card*/device; do
+    [[ -r $dev/mem_info_vram_total ]] || continue
+    (( $(<$dev/mem_info_vram_total) > total )) && { total=$(<$dev/mem_info_vram_total); best=$dev }
+  done
+  [[ -n $best ]] && printf 'VRAM: %.1f / %.1f GiB used\n' $(( $(<$best/mem_info_vram_used) / 2.0**30 )) $(( total / 2.0**30 ))
+}
+
+on() {
+  # Start the services by name too: local-ai.target stays "active" after llama-server is
+  # stopped on its own, and starting an active target does nothing.
+  systemctl --user start $TARGET llama-server.service voice-assistant.service || return 1
+  print -n "starting"
+  local url i
+  for url in $HEALTH; do
+    for i in {1..120}; do
+      curl -sf -o /dev/null $url && break
+      print -n .; sleep 1
+    done
+    curl -sf -o /dev/null $url || { print "\ntimed out waiting for $url (see: ai-toggle status)"; return 1 }
+  done
+  print "\nready"
+}
+
+MEMDIR=~/.local/share/voice-assistant/memory           # the assistant's own notes
+CLAUDE_MEMDIR=~/.claude/projects/-home-dean/memory      # Claude's, read-only to the assistant
+
+mem() {
+  if [[ -n $1 ]]; then
+    exec ${EDITOR:-vi} $MEMDIR/$1.md
+  fi
+  local d f
+  for d in $CLAUDE_MEMDIR $MEMDIR; do
+    [[ $d == $MEMDIR ]] && print "assistant's notes: $d" || print "Claude's memory (read-only): $d"
+    for f in $d/*.md(N); do
+      [[ ${f:t} == MEMORY.md ]] && continue
+      printf '  %-28s %-9s %s\n' ${${f:t:r}//_/-} "$(sed -n 's/^ *type: //p' $f | head -1)" \
+        "$(sed -n 's/^description: //p' $f | head -1 | tr -d '"' | cut -c1-80)"
+    done
+  done
+}
+
+off() {
+  systemctl --user stop $TARGET && print "stopped"
+}
+
+status() {
+  local u mem
+  for u in $UNITS; do
+    mem=$(systemctl --user show -p MemoryCurrent --value $u)
+    [[ $mem == <-> ]] && mem=$(printf '%.1f GiB' $(( mem / 2.0**30 ))) || mem=-
+    printf '%-16s %-10s %s\n' $u "$(systemctl --user is-active $u)" $mem
+  done
+  vram
+}
+
+case ${1:-toggle} in
+  on)     on ;;
+  off)    off ;;
+  status) status ;;
+  vram)   vram ;;
+  log)    exec journalctl --user -fu voice-assistant -o cat -n 50 ;;
+  mem)    mem $2 ;;
+  chat)   exec python3 ${0:A:h}/voice-assistant.py --chat ;;
+  toggle) if systemctl --user -q is-active llama-server; then off; else on; fi ;;
+  *)      print -u2 "usage: ai-toggle [on|off|status|log|chat|mem [topic]]"; exit 2 ;;
+esac
